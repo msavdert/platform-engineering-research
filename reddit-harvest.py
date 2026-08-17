@@ -1,57 +1,136 @@
-#!/usr/bin/env -S uv run --script
-# Harvest public Reddit threads and comments for the R2 segment questions, into
-# a local corpus a delegate can read offline. Authors are never written.
-# Last updated: 2026-08-15
-#
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
-THREADS_PER_QUERY = 10
-MIN_BODY_CHARS = 200  # Shorter comments are reactions, not descriptions.
+"""
+Personal research tool: find Reddit discussions about transitioning from
+database administration into platform engineering.
+
+Read-only. No posting, voting, or messaging.
+Results are written to a local Markdown file for manual reading and are
+not redistributed, published, or used to train any model.
+"""
+
+import os
+import time
+import datetime as dt
+
+import praw
+
+# --- Configuration -----------------------------------------------------------
+
+SUBREDDITS = [
+    "devops",
+    "sre",
+    "platform_engineering",
+    "ExperiencedDevs",
+    "sysadmin",
+]
+
+QUERIES = [
+    "dba to platform engineer",
+    "database administrator career change",
+    "platform engineer interview experience",
+    "dba to devops",
+    "platform engineering skills required",
+]
+
+POSTS_PER_QUERY = 15      # keep the request volume low
+COMMENTS_PER_POST = 10    # top-level comments only
+SLEEP_BETWEEN_CALLS = 2   # be gentle, stay well under rate limits
+OUTPUT_FILE = "results.md"
 
 
-class Reddit:
-    def __init__(self, client_id: str, secret: str, user_agent: str) -> None:
-        self.ua = user_agent
-        self.token = self._authenticate(client_id, secret)
+# --- Reddit client -----------------------------------------------------------
 
-    def _authenticate(self, client_id: str, secret: str) -> str:
-        basic = base64.b64encode(f"{client_id}:{secret}".encode()).decode()
-        body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
-        req = urllib.request.Request(
-            TOKEN_URL,
-            data=body,
-            headers={"Authorization": f"Basic {basic}", "User-Agent": self.ua},
+def get_client() -> praw.Reddit:
+    """Credentials come from environment variables, never hardcoded."""
+    return praw.Reddit(
+        client_id=os.environ["REDDIT_CLIENT_ID"],
+        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+        user_agent=os.environ.get(
+            "REDDIT_USER_AGENT",
+            "script:career-research:v1.0 (personal, non-commercial)",
+        ),
+    )
+
+
+# --- Collection --------------------------------------------------------------
+
+def search_subreddit(reddit, subreddit_name, query):
+    """Search one subreddit for one query and return simplified results."""
+    results = []
+    subreddit = reddit.subreddit(subreddit_name)
+
+    for post in subreddit.search(query, sort="relevance", limit=POSTS_PER_QUERY):
+        post.comments.replace_more(limit=0)  # skip "load more" expansion
+        comments = [
+            c.body.strip()
+            for c in post.comments[:COMMENTS_PER_POST]
+            if getattr(c, "body", None)
+        ]
+
+        results.append(
+            {
+                "subreddit": subreddit_name,
+                "title": post.title,
+                "url": f"https://reddit.com{post.permalink}",
+                "score": post.score,
+                "created": dt.datetime.fromtimestamp(post.created_utc).date(),
+                "selftext": (post.selftext or "").strip(),
+                "comments": comments,
+            }
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())["access_token"]
+        time.sleep(SLEEP_BETWEEN_CALLS)
 
-    def get(self, path: str, **params) -> dict | list | None:
-        url = f"{API}{path}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "User-Agent": self.ua,
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                print("  429, sleeping 60s", file=sys.stderr)
-                time.sleep(60)
-                return None
-            print(f"  HTTP {exc.code} on {path}", file=sys.stderr)
-            return None
-        except Exception as exc:  # noqa: BLE001 - never abort a long harvest
-            print(f"  {type(exc).__name__}: {exc}", file=sys.stderr)
-            return None
-        finally:
-            time.sleep(PACE_SECONDS)
+    return results
+
+
+# --- Output ------------------------------------------------------------------
+
+def write_markdown(all_results, path=OUTPUT_FILE):
+    """Write everything to one Markdown file so it can be read in an editor."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Reddit research notes\n\n")
+        f.write(f"Collected on {dt.date.today().isoformat()}\n\n")
+
+        for item in all_results:
+            f.write(f"## {item['title']}\n\n")
+            f.write(
+                f"r/{item['subreddit']} · {item['score']} points · "
+                f"{item['created']}\n\n"
+            )
+            f.write(f"<{item['url']}>\n\n")
+
+            if item["selftext"]:
+                f.write(item["selftext"][:2000] + "\n\n")
+
+            if item["comments"]:
+                f.write("### Comments\n\n")
+                for comment in item["comments"]:
+                    f.write(f"- {comment[:1000]}\n\n")
+
+            f.write("---\n\n")
+
+
+# --- Main --------------------------------------------------------------------
+
+def main():
+    reddit = get_client()
+    seen_urls = set()
+    all_results = []
+
+    for subreddit_name in SUBREDDITS:
+        for query in QUERIES:
+            print(f"Searching r/{subreddit_name}: {query!r}")
+            try:
+                for item in search_subreddit(reddit, subreddit_name, query):
+                    if item["url"] not in seen_urls:
+                        seen_urls.add(item["url"])
+                        all_results.append(item)
+            except Exception as exc:
+                print(f"  skipped ({exc})")
+            time.sleep(SLEEP_BETWEEN_CALLS)
+
+    write_markdown(all_results)
+    print(f"\n{len(all_results)} threads written to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
